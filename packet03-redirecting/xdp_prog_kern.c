@@ -267,7 +267,7 @@ int xdp_router_func(struct xdp_md *ctx)
 		struct in6_addr *dst = (struct in6_addr *) fib_params.ipv6_dst;
 
 		ip6h = data + nh_off;
-		if (ip6h + 1 > data_end) {
+		if (ip6h + 1 > data_end) { 
 			action = XDP_DROP;
 			goto out;
 		}
