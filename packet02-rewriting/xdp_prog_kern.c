@@ -16,12 +16,12 @@
  */
 static __always_inline int vlan_tag_pop(struct xdp_md *ctx, struct ethhdr *eth)
 {
-	/*
+	
 	void *data_end = (void *)(long)ctx->data_end;
 	struct ethhdr eth_cpy;
 	struct vlan_hdr *vlh;
 	__be16 h_proto;
-	*/
+	
 	int vlid = -1;
 
 	/* Check if there is a vlan tag to pop */
@@ -39,7 +39,28 @@ static __always_inline int vlan_tag_pop(struct xdp_md *ctx, struct ethhdr *eth)
 	 */
 
 	/* Copy back the old Ethernet header and update the proto type */
+	if (!proto_is_vlan(eth->h_proto))
+		return -1;
+	vlh = (void*) (eth + 1);
 
+	if (vlh + 1 > data_end)
+		return -1;
+
+	vlid =bpf_ntohs(vlh->h_vlan_TCI);
+	h_proto = vlh->h_vlan_encapsulated_proto;
+
+	__builtin_memcpy(&eth_cpy, eth, sizeof(eth_cpy));
+
+	if (bpf_xdp_adjust_head(ctx, (int)sizeof(*vlh)))
+		return -1;
+
+	eth = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+	if (eth + 1 > data_end)
+		return -1;
+
+	__builtin_memcpy(eth, &eth_cpy, sizeof(*eth));
+	eth->h_proto = h_proto;
 
 	return vlid;
 }
@@ -50,6 +71,32 @@ static __always_inline int vlan_tag_pop(struct xdp_md *ctx, struct ethhdr *eth)
 static __always_inline int vlan_tag_push(struct xdp_md *ctx,
 					 struct ethhdr *eth, int vlid)
 {
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr eth_cpy;
+	struct vlan_hdr *vlh;
+
+	__builtin_memcpy(&eth_cpy, eth, sizeof(eth_cpy));
+
+	if (bpf_xdp_adjust_head(ctx, 0 - (int)sizeof(*vlh)))
+		return -1;
+
+	data_end = (void *)(long)ctx->data_end;
+	eth = (void *)(long)ctx->data;
+
+	if (eth + 1 > data_end)
+		return -1;
+	
+	__builtin_memcpy(eth, &eth_cpy, sizeof(*eth));
+
+	vlh = (void *)(eth + 1);
+
+	if (vlh + 1 > data_end)
+		return -1;
+
+	vlh->h_vlan_TCI = bpf_htons(vlid);
+	vlh->h_vlan_encapsulated_proto = eth->h_proto;
+
+	eth->h_proto = bpf_htons(ETH_P_8021Q);
 	return 0;
 }
 
@@ -57,7 +104,52 @@ static __always_inline int vlan_tag_push(struct xdp_md *ctx,
 SEC("xdp_port_rewrite")
 int xdp_port_rewrite_func(struct xdp_md *ctx)
 {
-	return XDP_PASS;
+	void *data_end = (void *)(long)ctx->data_end;
+	void *data = (void *)(long)ctx->data;
+
+	/* These keep track of the next header type and iterator pointer */
+	struct hdr_cursor nh;
+	int nh_type;
+	nh.pos = data;
+
+	struct ethhdr *eth;
+
+	__u32 action = XDP_PASS; /* Default action */
+
+	/* Packet parsing in steps: Get each header one at a time, aborting if
+	 * parsing fails. Each helper function does sanity checking (is the
+	 * header type in the packet correct?), and bounds checking.
+	 */
+	nh_type = parse_ethhdr(&nh, data_end, &eth);
+
+	if (nh_type == bpf_htons(ETH_P_IPV6)) {
+		struct ipv6hdr *ip6h;
+		nh_type = parse_ip6hdr(&nh, data_end, &ip6h);
+	} else if (nh_type == bpf_htons(ETH_P_IP)) {
+		struct iphdr *iph;		
+		nh_type = parse_iphdr(&nh, data_end, &iph);
+	}
+	if (nh_type == IPPROTO_TCP)
+	{
+		struct tcphdr *tcphdr; 
+		if (parse_tcphdr(&nh, data_end, & tcphdr) < 0){
+			action = XDP_ABORTED;
+			goto out;
+		}
+		tcphdr->dest = bpf_htons(bpf_ntohs(tcphdr->dest) - 1);
+	}
+	else if (nh_type == IPPROTO_UDP)
+	{
+		struct udphdr *udphdr; 
+		if (parse_udphdr(&nh, data_end, & udphdr) < 0){
+			action = XDP_ABORTED;
+			goto out;
+		}
+		udphdr->dest = bpf_htons(bpf_ntohs(udphdr->dest) - 1);
+	}
+
+out:
+	return xdp_stats_record_action(ctx, action);
 }
 
 /* VLAN swapper; will pop outermost VLAN tag if it exists, otherwise push a new
